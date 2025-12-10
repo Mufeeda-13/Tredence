@@ -1,0 +1,134 @@
+# app/engine.py
+from typing import Any, Callable, Dict, List, Optional, Tuple
+import uuid
+
+State = Dict[str, Any]
+NodeFunc = Callable[[State], Tuple[State, Optional[str]]]
+
+# Simple global tool registry
+TOOL_REGISTRY: Dict[str, NodeFunc] = {}
+
+
+def register_tool(name: str) -> Callable[[NodeFunc], NodeFunc]:
+    """
+    Decorator to register a Python function as a tool/node
+    in the global TOOL_REGISTRY.
+    """
+    def decorator(func: NodeFunc) -> NodeFunc:
+        TOOL_REGISTRY[name] = func
+        return func
+    return decorator
+
+
+class Graph:
+    def __init__(self, nodes: List[str], edges: Dict[str, str], start_node: str):
+        self.nodes = nodes
+        self.edges = edges
+        self.start_node = start_node
+
+
+class GraphRun:
+    def __init__(
+        self,
+        run_id: str,
+        graph_id: str,
+        current_node: Optional[str],
+        state: State,
+    ):
+        self.run_id = run_id
+        self.graph_id = graph_id
+        self.current_node = current_node
+        self.state = state
+        self.log: List[str] = []
+        self.finished: bool = False
+
+
+class WorkflowEngine:
+    """
+    Minimal in-memory workflow / graph engine.
+
+    - Nodes: named tools in TOOL_REGISTRY
+    - State: Python dict passed between nodes
+    - Edges: node_name -> next_node_name
+    - Branching & looping: node can return an override next_node
+      (including itself for a loop)
+    """
+
+    def __init__(self, tool_registry: Dict[str, NodeFunc]):
+        self.tool_registry = tool_registry
+        self.graphs: Dict[str, Graph] = {}
+        self.runs: Dict[str, GraphRun] = {}
+        self.default_graph_id: Optional[str] = None
+
+    # ---------- Graph management ----------
+
+    def create_graph(
+        self,
+        nodes: List[str],
+        edges: Dict[str, str],
+        start_node: str,
+    ) -> str:
+        if start_node not in nodes:
+            raise ValueError("start_node must be one of the nodes")
+
+        for node in nodes:
+            if node not in self.tool_registry:
+                # Not strictly required, but nice validation
+                raise ValueError(f"Node '{node}' has no registered tool")
+
+        graph_id = str(uuid.uuid4())
+        self.graphs[graph_id] = Graph(nodes=nodes, edges=edges, start_node=start_node)
+        return graph_id
+
+    # ---------- Execution ----------
+
+    def run_graph(self, graph_id: str, initial_state: State) -> GraphRun:
+        graph = self.graphs.get(graph_id)
+        if graph is None:
+            raise ValueError(f"Graph '{graph_id}' not found")
+
+        run_id = str(uuid.uuid4())
+        run = GraphRun(
+            run_id=run_id,
+            graph_id=graph_id,
+            current_node=graph.start_node,
+            state=initial_state.copy(),
+        )
+        self.runs[run_id] = run
+
+        current = run.current_node
+
+        while current is not None:
+            tool = self.tool_registry.get(current)
+            if tool is None:
+                run.log.append(f"[ERROR] No tool registered for node '{current}'. Stopping.")
+                break
+
+            run.log.append(f"[INFO] Running node: {current}")
+            state, next_node_override = tool(run.state)
+            run.state = state
+
+            # Decide next node: override > edge
+            if next_node_override is not None:
+                next_node = next_node_override
+                run.log.append(f"[DEBUG] Next node override: {next_node}")
+            else:
+                next_node = graph.edges.get(current)
+
+            # Special convention: "__END__" means stop
+            if next_node == "__END__" or next_node is None:
+                run.log.append("[INFO] Reached end of graph.")
+                current = None
+                break
+
+            # Very simple loop prevention (optional)
+            run.current_node = next_node
+            current = next_node
+
+        run.finished = True
+        return run
+
+    # ---------- State retrieval ----------
+
+    def get_run(self, run_id: str) -> Optional[GraphRun]:
+        return self.runs.get(run_id)
